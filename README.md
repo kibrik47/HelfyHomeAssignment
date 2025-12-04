@@ -23,10 +23,12 @@ capabilities.
 ## Setup Instructions
 
 1. **Clone the repository**
-git clone <repo url>
+git clone (repo url)
 
 2. **Start the services using Docker Compose**
+
 first time running: docker-compose up --build
+
 Onwards: docker-compose up
 
 3. **Access frontend**
