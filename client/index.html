@@ -1,0 +1,56 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Simple Login</title>
+</head>
+<body>
+  <h2>Login</h2>
+  <form id="loginForm">
+    <label>Username or Email: <input id="username" required /></label><br/>
+    <label>Password: <input id="password" type="password" required /></label><br/>
+    <button type="submit">Login</button>
+  </form>
+
+  <pre id="out"></pre>
+
+  <script>
+    const out = document.getElementById('out');
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const usernameOrEmail = document.getElementById('username').value;
+      const password = document.getElementById('password').value;
+      try {
+        const r = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ usernameOrEmail, password })
+        });
+        const data = await r.json();
+        out.textContent = JSON.stringify({ status: r.status, body: data }, null, 2);
+        if (r.status === 200 && data.token) {
+          localStorage.setItem('auth_token', data.token);
+          out.textContent += "\nToken saved to localStorage as 'auth_token'";
+        }
+      } catch (err) {
+        out.textContent = ''+err;
+      }
+    });
+
+    // helper to call protected endpoint
+    async function callProfile() {
+      const token = localStorage.getItem('auth_token');
+      if (!token) { out.textContent = 'no token'; return; }
+      const r = await fetch('/profile', { headers: { 'x-auth-token': token } });
+      const d = await r.json();
+      out.textContent = JSON.stringify({ status: r.status, body: d }, null, 2);
+    }
+
+    // serve both client and proxy to api; simple UI so we expose a button
+    const btn = document.createElement('button');
+    btn.textContent = 'Call /profile with stored token';
+    btn.onclick = callProfile;
+    document.body.appendChild(btn);
+  </script>
+</body>
+</html>

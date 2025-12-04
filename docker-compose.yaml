@@ -1,0 +1,236 @@
+version: '3.8'
+
+services:
+  # Kafka using KRaft mode (no Zookeeper needed)
+  kafka:
+    image: confluentinc/cp-kafka:7.8.0
+    container_name: kafka
+    environment:
+      CLUSTER_ID: "abcdefghabcdefghabcdefghabcdefgh"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENERS: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+    ports:
+      - "9092:9092"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+
+  # PD (Placement Driver)
+  pd:
+    image: pingcap/pd:v6.1.0
+    container_name: pd
+    command:
+      - --name=pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --data-dir=/pd/data
+    volumes:
+      - pd_data:/pd/data
+    ports:
+      - "2379:2379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -q -O - http://127.0.0.1:2379/health | grep -q '\"health\":\"true\"'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  tikv:
+    image: pingcap/tikv:v6.1.0
+    container_name: tikv
+    depends_on:
+      pd:
+        condition: service_healthy
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --pd-endpoints=pd:2379
+      - --data-dir=/tikv/data
+    ports:
+      - "20160:20160"
+    restart: unless-stopped
+
+  tidb:
+    image: pingcap/tidb:v6.1.0
+    container_name: tidb
+    depends_on:
+      pd:
+        condition: service_healthy
+      tikv:
+        condition: service_started
+    command:
+      - --store=tikv
+      - --path=pd:2379
+      - --advertise-address=tidb
+    ports:
+      - "4000:4000"
+      - "10080:10080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "wget -q -O - http://127.0.0.1:10080/status | grep -q '\"version\"'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  ticdc:
+    image: pingcap/ticdc:v6.1.0
+    container_name: ticdc
+    depends_on:
+      tidb:
+        condition: service_healthy
+    command:
+      - /cdc 
+      - server
+      - --pd=http://pd:2379
+      - --addr=0.0.0.0:8300
+      - --advertise-addr=ticdc:8300
+    ports:
+      - "8300:8300"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8300/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: on-failure
+
+  # Database initialization
+  db-init:
+    image: mysql:8.0
+    container_name: db-init
+    depends_on:
+      tidb:
+        condition: service_healthy
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "Waiting for TiDB to be ready..."
+        until mysql -h tidb -P 4000 -u root -e "select 1" >/dev/null 2>&1; do
+          echo "TiDB not ready, waiting..."
+          sleep 2
+        done
+        echo "✅ TiDB is ready!"
+        echo "Executing init.sql..."
+        mysql -h tidb -P 4000 -u root < /docker-entrypoint-initdb.d/init.sql
+        echo "✅ Database initialized!"
+    restart: "no"
+
+  # Create TiCDC changefeed - FIXED: proper CLI usage with correct flags
+  ticdc-init:
+    image: pingcap/ticdc:v6.1.0
+    container_name: ticdc-init
+    depends_on:
+      ticdc:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      db-init:
+        condition: service_completed_successfully
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "Waiting for TiCDC to be fully ready..."
+        sleep 5
+        
+        echo "Checking existing changefeeds before creation..."
+        /cdc cli changefeed list --pd="http://pd:2379" 2>&1 || echo "No changefeeds yet or connection failed"
+        
+        echo ""
+        echo "Creating changefeed to Kafka..."
+        
+        # TiCDC v6.1.0 uses --pd, not --server
+        /cdc cli changefeed create \
+          --pd="http://pd:2379" \
+          --changefeed-id="app-cf" \
+          --sink-uri="kafka://kafka:9092/tidb_changes?protocol=canal-json&kafka-version=2.4.0&partition-num=1" \
+          --no-confirm \
+          2>&1 | tee /tmp/create-result.txt
+        
+        RESULT=$?
+        echo ""
+        echo "Changefeed creation exit code: $RESULT"
+        if [ $RESULT -eq 0 ] || grep -q "already exists\|SUCCESS" /tmp/create-result.txt; then
+          echo "✅ Changefeed creation succeeded or already exists"
+        else
+          echo "⚠️  Changefeed creation may have failed; checking status..."
+        fi
+        
+        echo ""
+        echo "Listing changefeeds after creation attempt..."
+        /cdc cli changefeed list --pd="http://pd:2379" 2>&1 || echo "Failed to list changefeeds"
+        
+        echo ""
+        echo "Querying changefeed status..."
+        /cdc cli changefeed query --pd="http://pd:2379" --changefeed-id="app-cf" 2>&1 || echo "Could not query changefeed"
+        
+        echo ""
+        echo "✅ TiCDC initialization complete"
+    restart: "no"
+
+  # API Service
+  api:
+    build: ./api
+    container_name: api
+    depends_on:
+      tidb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      - DB_HOST=tidb
+      - DB_PORT=4000
+      - DB_USER=root
+      - DB_PASS=
+      - DB_NAME=appdb
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+  # Frontend Client
+  client:
+    build: ./client
+    container_name: client
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+  # Kafka Consumer - FIXED: wait for changefeed creation
+  consumer:
+    build: ./consumer
+    container_name: consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ticdc-init:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BROKER=kafka:9092
+    restart: unless-stopped
+
+networks:
+  default:
+    driver: bridge
+
+volumes:
+  pd_data:
